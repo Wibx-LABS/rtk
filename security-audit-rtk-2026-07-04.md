@@ -49,6 +49,12 @@ osv-scanner flags transitive crates in `Cargo.lock` (upstream, not our code):
 decision the audited SHA is pinned now, with a follow-up to bump `quick-xml`/`anyhow` in
 the fork and re-pin. Not a compromise indicator.
 
+**RESOLVED 2026-07-04:** bumped `quick-xml` 0.37.5 → 0.41.0 and `anyhow` 1.0.102 →
+1.0.103 in the fork. Migrated the two 0.41 API breaks (`BytesText::unescape` →
+`xml10_content`, `Attribute::decode_and_unescape_value` → `decoded_and_normalized_value`)
+in `src/cmds/dotnet/`. `cargo build` clean, **2360 unit tests pass**, and **osv-scanner
+reports no issues**. Re-pin the aggregator/devkit to the bumped SHA.
+
 ## CI hygiene (non-runtime)
 
 `github-actions-mutable-action-tag` across workflows and `secrets: inherit` in `cd.yml`
