@@ -618,7 +618,8 @@ fn scan_mtp_kind_in_file(path: &Path) -> MtpProjectKind {
                 );
             }
             Ok(Event::Text(e)) if inside_mtp_element => {
-                if let Ok(text) = e.unescape() {
+                // quick-xml 0.41: BytesText::unescape() -> xml10_content() (XML 1.0 text decode + entity/EOL normalization)
+                if let Ok(text) = e.xml10_content() {
                     if text.trim().eq_ignore_ascii_case("true") {
                         return MtpProjectKind::VsTestBridge;
                     }
