@@ -351,7 +351,7 @@ section "curl"
 # and flagged rtk's JSON passthrough as a false "negative". Same-file input makes
 # the comparison deterministic while still exercising the real curl/wget filters.
 if command -v curl &> /dev/null; then
-  curl -s https://mockhttp.org/json > /tmp/rtk_bench_curl.json 2>/dev/null || true
+  curl -s https://mockhttp.org/json/1 > /tmp/rtk_bench_curl.json 2>/dev/null || true
   curl -s https://mockhttp.org/robots.txt > /tmp/rtk_bench_curl.txt 2>/dev/null || true
   if [ -s /tmp/rtk_bench_curl.json ]; then
     bench "curl json" "curl -s file:///tmp/rtk_bench_curl.json" "$RTK curl file:///tmp/rtk_bench_curl.json"
