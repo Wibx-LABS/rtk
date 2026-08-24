@@ -1700,6 +1700,13 @@ pub fn args_display(args: &[OsString]) -> String {
 mod tests {
     use super::*;
 
+    /// Serialises every test that mutates the process-global `RTK_DB_PATH`.
+    ///
+    /// Must live at module scope: a `static` declared inside a function is a
+    /// distinct object per function, so per-test locks with the same name do not
+    /// synchronise with each other and the tests race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
     fn test_estimate_tokens() {
@@ -1827,8 +1834,6 @@ mod tests {
     #[test]
     fn test_db_path_env_and_default() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
@@ -1849,8 +1854,6 @@ mod tests {
     #[test]
     fn test_builds_never_resolve_to_the_real_user_database() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let saved = env::var("RTK_DB_PATH").ok();
