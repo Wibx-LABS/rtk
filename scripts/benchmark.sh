@@ -345,19 +345,30 @@ bench "wc" "wc Cargo.toml src/main.rs" "$RTK wc Cargo.toml src/main.rs"
 # curl
 # ===================
 section "curl"
+# Capture each endpoint ONCE into a local fixture, then bench both sides against
+# file://. mockhttp.org returns a fresh random body per request, so hitting it
+# twice (once for the baseline, once for rtk) compared two different responses
+# and flagged rtk's JSON passthrough as a false "negative". Same-file input makes
+# the comparison deterministic while still exercising the real curl/wget filters.
 if command -v curl &> /dev/null; then
-  bench "curl json" "curl -s https://mockhttp.org/json" "$RTK curl https://mockhttp.org/json"
-  bench "curl text" "curl -s https://mockhttp.org/robots.txt" "$RTK curl https://mockhttp.org/robots.txt"
+  curl -s https://mockhttp.org/json/1 > /tmp/rtk_bench_curl.json 2>/dev/null || true
+  curl -s https://mockhttp.org/robots.txt > /tmp/rtk_bench_curl.txt 2>/dev/null || true
+  if [ -s /tmp/rtk_bench_curl.json ]; then
+    bench "curl json" "curl -s file:///tmp/rtk_bench_curl.json" "$RTK curl file:///tmp/rtk_bench_curl.json"
+  fi
+  if [ -s /tmp/rtk_bench_curl.txt ]; then
+    bench "curl text" "curl -s file:///tmp/rtk_bench_curl.txt" "$RTK curl file:///tmp/rtk_bench_curl.txt"
+  fi
 fi
 
 # ===================
 # wget
 # ===================
-if command -v wget &> /dev/null; then
+if command -v wget &> /dev/null && [ -s /tmp/rtk_bench_curl.json ]; then
   section "wget"
-  bench "wget" "wget -qO- https://mockhttp.org/json" "$RTK wget https://mockhttp.org/json"
-  rm -f json 2>/dev/null
+  bench "wget" "wget -qO- file:///tmp/rtk_bench_curl.json" "$RTK wget file:///tmp/rtk_bench_curl.json"
 fi
+rm -f /tmp/rtk_bench_curl.json /tmp/rtk_bench_curl.txt json 2>/dev/null
 
 # ===================
 # npm (standalone — does not require package.json)
