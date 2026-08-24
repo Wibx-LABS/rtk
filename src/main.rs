@@ -1335,11 +1335,12 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
                     core::runner::emit_guarded(&filtered, hint.as_deref(), &combined_raw)
                 };
 
-                timer.track(
+                timer.track_with_loss(
                     &raw_command,
                     &format!("rtk:toml {}", raw_command),
                     &combined_raw,
                     &shown,
+                    loss.as_db_str(),
                 );
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
@@ -2591,11 +2592,14 @@ fn run_cli() -> Result<i32> {
             let full_output = format!("{}{}", stdout, stderr);
 
             // Track usage (input = output since no filtering)
-            timer.track(
+            timer.track_with_loss(
                 &format!("{} {}", cmd_name, cmd_args.join(" ")),
                 &format!("rtk proxy {} {}", cmd_name, cmd_args.join(" ")),
                 &full_output,
                 &full_output,
+                // Unfiltered passthrough: input and output are the same string,
+                // so `none` is proven by construction, not assumed.
+                "none",
             );
 
             core::utils::exit_code_from_status(&status, &cmd_name)

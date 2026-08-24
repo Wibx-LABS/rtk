@@ -1417,9 +1417,6 @@ impl TimedExecution {
     /// - `input`: Standard command output (for token estimation)
     /// - `output`: RTK command output (for token estimation)
     /// - `lossiness`: `none`, `tail`, `whole`, or `unknown`
-    // allow(dead_code): no call site until Task 2 (R4-lossiness-accounting) wires
-    // this in at the TOML-filter dispatch site. Remove this attribute in Task 2.
-    #[allow(dead_code)]
     pub fn track_with_loss(
         &self,
         original_cmd: &str,

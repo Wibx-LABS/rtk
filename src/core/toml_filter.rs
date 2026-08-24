@@ -519,11 +519,6 @@ impl Lossiness {
     /// the dropped text, and the tracking DB stores analytics, not content. These
     /// strings are a persisted format — changing one silently reinterprets every
     /// historical row, so treat them as fixed.
-    // allow(dead_code): no production caller until Task 2 (R4-lossiness-accounting)
-    // wires this in at the TOML-filter dispatch site. Only the inline test below
-    // calls it for now, which is enough to prove the encoding but not enough to
-    // satisfy `cargo build`'s dead-code lint. Remove this attribute in Task 2.
-    #[allow(dead_code)]
     pub fn as_db_str(&self) -> &'static str {
         match self {
             Lossiness::None => "none",
