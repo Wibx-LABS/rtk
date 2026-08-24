@@ -9,7 +9,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn rtk() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rtk"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rtk"));
+    cmd.env(
+        "RTK_DB_PATH",
+        std::env::temp_dir().join(format!("rtk-it-{}.db", std::process::id())),
+    );
+    cmd
 }
 
 /// Run rtk with `input` fed on stdin; returns (stdout, exit_code).

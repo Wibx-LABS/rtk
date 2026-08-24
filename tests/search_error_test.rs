@@ -7,6 +7,10 @@ use std::process::Command;
 
 fn rtk(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rtk"))
+        .env(
+            "RTK_DB_PATH",
+            std::env::temp_dir().join(format!("rtk-it-{}.db", std::process::id())),
+        )
         .env("LC_ALL", "C")
         .args(args)
         .output()

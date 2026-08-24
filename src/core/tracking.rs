@@ -1443,10 +1443,25 @@ fn db_sidecars(db_path: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+// The `#[cfg(test)]` early return below is an unconditional short-circuit under
+// `cargo test`, which makes the Priority 2/3 code that follows genuinely
+// unreachable in that build — allow it only there; release builds keep the
+// lint (and never see the block at all).
+#[cfg_attr(test, allow(unreachable_code))]
 pub(crate) fn get_db_path() -> Result<PathBuf> {
     // Priority 1: Environment variable RTK_DB_PATH
     if let Ok(custom_path) = std::env::var("RTK_DB_PATH") {
         return Ok(PathBuf::from(custom_path));
+    }
+
+    // A test build never falls back to the real user database. Without this,
+    // `cargo test` writes synthetic rows into the developer's own analytics and
+    // applies schema migrations to it — measured at 130 rows for one full run.
+    // `RTK_DB_PATH` above still wins, so a test can still choose its own file.
+    // Compiles away entirely in a release build.
+    #[cfg(test)]
+    {
+        return Ok(std::env::temp_dir().join(format!("rtk-unit-test-{}.db", std::process::id())));
     }
 
     // Priority 2: Configuration file
@@ -1685,6 +1700,13 @@ pub fn args_display(args: &[OsString]) -> String {
 mod tests {
     use super::*;
 
+    /// Serialises every test that mutates the process-global `RTK_DB_PATH`.
+    ///
+    /// Must live at module scope: a `static` declared inside a function is a
+    /// distinct object per function, so per-test locks with the same name do not
+    /// synchronise with each other and the tests race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
     fn test_estimate_tokens() {
@@ -1812,8 +1834,6 @@ mod tests {
     #[test]
     fn test_db_path_env_and_default() {
         use std::env;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
@@ -1824,10 +1844,32 @@ mod tests {
         env::remove_var("RTK_DB_PATH");
         let db_path = get_db_path().expect("Failed to get db path");
         assert!(
-            db_path.ends_with("rtk/history.db"),
-            "expected default path ending with rtk/history.db, got: {}",
+            db_path.to_string_lossy().contains("rtk-unit-test-"),
+            "with RTK_DB_PATH unset, a test build must resolve to a temp file, \
+             not the real analytics database; got {}",
             db_path.display()
         );
+    }
+
+    #[test]
+    fn test_builds_never_resolve_to_the_real_user_database() {
+        use std::env;
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let saved = env::var("RTK_DB_PATH").ok();
+        env::remove_var("RTK_DB_PATH");
+
+        let path = get_db_path().expect("get_db_path");
+        assert!(
+            !path.ends_with("rtk/history.db"),
+            "a test build resolved to the real analytics database at {} — \
+             a cargo test run would write synthetic rows into real user data",
+            path.display()
+        );
+
+        if let Some(v) = saved {
+            env::set_var("RTK_DB_PATH", v);
+        }
     }
 
     // 9. project_filter_params uses GLOB pattern with * wildcard // added
