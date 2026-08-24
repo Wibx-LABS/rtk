@@ -159,6 +159,27 @@ pub fn run(
             eprintln!();
         }
 
+        let loss = tracker.lossiness_breakdown(project_scope.as_deref())?;
+        if loss.total > 0 {
+            println!();
+            println!("{}", styled("Filter cost", true));
+            println!(
+                "  filters classified: lossless {}   tail-dropping {}   fully-replacing {}",
+                loss.none, loss.tail, loss.whole
+            );
+            println!(
+                "  {} tokens booked as saved by results that dropped output",
+                format_tokens(loss.saved_tokens_in_lossy)
+            );
+            // Never present the buckets above as if they covered all traffic.
+            println!(
+                "  coverage: {:.1}% of {} commands ({} record no lossiness)",
+                loss.known_pct(),
+                loss.total,
+                loss.unknown
+            );
+        }
+
         if !summary.by_command.is_empty() {
             // added: styled section header
             println!("{}", styled("By Command", true));

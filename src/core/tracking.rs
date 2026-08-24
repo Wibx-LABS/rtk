@@ -223,6 +223,37 @@ pub struct MonthStats {
 /// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
 type CommandStats = (String, usize, usize, f64, u64);
 
+/// Counts of recorded commands by how much output their filter dropped.
+///
+/// `unknown` is not a failure state: it is every call site that computes no
+/// `Lossiness`, which today is most of them. `known_pct` exists so a caller
+/// cannot present the other buckets as if they described all traffic.
+#[derive(Debug, Default, Serialize)]
+pub struct LossinessBreakdown {
+    /// Filter provably dropped nothing.
+    pub none: usize,
+    /// Filter kept a head and dropped a recoverable tail.
+    pub tail: usize,
+    /// Filter replaced the whole output.
+    pub whole: usize,
+    /// Call site recorded no lossiness.
+    pub unknown: usize,
+    /// All recorded commands in scope.
+    pub total: usize,
+    /// Tokens booked as saved by rows that dropped output (`tail` + `whole`).
+    pub saved_tokens_in_lossy: usize,
+}
+
+impl LossinessBreakdown {
+    /// Percentage of commands whose lossiness is actually known. Zero when empty.
+    pub fn known_pct(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        ((self.total - self.unknown) as f64 / self.total as f64) * 100.0
+    }
+}
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -599,6 +630,56 @@ impl Tracker {
     #[allow(dead_code)]
     pub fn get_summary(&self) -> Result<GainSummary> {
         self.get_summary_filtered(None) // delegate to filtered variant
+    }
+
+    /// Count recorded commands by lossiness bucket, optionally scoped to a project.
+    ///
+    /// Rows written before the `lossiness` column existed read as `unknown`
+    /// through the column default; a NULL is also folded into `unknown` so a
+    /// database migrated by an older build cannot silently vanish from the total.
+    pub fn lossiness_breakdown(
+        &self,
+        project_scope: Option<&str>,
+    ) -> Result<LossinessBreakdown> {
+        let (clause, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &project_scope {
+            Some(p) => ("WHERE project_path = ?1", vec![p]),
+            None => ("", vec![]),
+        };
+
+        let sql = format!(
+            "SELECT COALESCE(lossiness, 'unknown') AS l, COUNT(*), SUM(saved_tokens)
+             FROM commands {clause} GROUP BY l"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+            ))
+        })?;
+
+        let mut b = LossinessBreakdown::default();
+        for row in rows {
+            let (bucket, count, saved) = row?;
+            match bucket.as_str() {
+                "none" => b.none = count,
+                "tail" => {
+                    b.tail = count;
+                    b.saved_tokens_in_lossy += saved;
+                }
+                "whole" => {
+                    b.whole = count;
+                    b.saved_tokens_in_lossy += saved;
+                }
+                // Any unrecognized value is counted as unknown rather than
+                // dropped, so `total` always equals the row count.
+                _ => b.unknown += count,
+            }
+            b.total += count;
+        }
+        Ok(b)
     }
 
     /// Get summary statistics filtered by project path. // added
@@ -1785,5 +1866,32 @@ mod tests {
             "an uninstrumented call site must record `unknown`, never `none` — \
              claiming a hand-written filter was lossless would be a lie"
         );
+    }
+
+    #[test]
+    fn lossiness_breakdown_counts_each_bucket_and_lossy_savings() {
+        let tracker = Tracker::new_in_memory().unwrap();
+        tracker.record_with_loss("a", "rtk:toml a", 100, 10, 1, "none").unwrap();
+        tracker.record_with_loss("b", "rtk:toml b", 100, 10, 1, "tail").unwrap();
+        tracker.record_with_loss("c", "rtk:toml c", 200, 20, 1, "whole").unwrap();
+        tracker.record("d", "rtk git status", 100, 10, 1).unwrap();
+
+        let b = tracker.lossiness_breakdown(None).unwrap();
+        assert_eq!(b.none, 1);
+        assert_eq!(b.tail, 1);
+        assert_eq!(b.whole, 1);
+        assert_eq!(b.unknown, 1);
+        assert_eq!(b.total, 4);
+        // savings booked by rows that dropped output: (100-10) + (200-20)
+        assert_eq!(b.saved_tokens_in_lossy, 270);
+        assert_eq!(b.known_pct().round() as i64, 75);
+    }
+
+    #[test]
+    fn lossiness_breakdown_is_empty_safe() {
+        let tracker = Tracker::new_in_memory().unwrap();
+        let b = tracker.lossiness_breakdown(None).unwrap();
+        assert_eq!(b.total, 0);
+        assert_eq!(b.known_pct(), 0.0, "no rows must not divide by zero");
     }
 }
