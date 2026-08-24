@@ -461,12 +461,14 @@ fn run_log(
         let n = parse_user_limit(args).unwrap_or(10);
         (n, true)
     } else if has_format_flag {
-        // --oneline / --pretty without -N: user wants compact output, allow more
-        cmd.arg("-50");
+        // --oneline / --pretty without -N: user wants compact output, allow more.
+        // One more than we show, so we can tell whether history continues without
+        // a second git invocation. The extra item is never rendered.
+        cmd.arg("-51");
         (50, false)
     } else {
-        // No flags at all: default to 10
-        cmd.arg("-10");
+        // No flags at all: default to 10, plus the same probe item.
+        cmd.arg("-11");
         (10, false)
     };
 
@@ -496,7 +498,12 @@ fn run_log(
     }
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
-    let filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
+    let mut filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
+    // rtk set the limit and git had more to give: say so, or the model reads a
+    // capped history as a complete one.
+    if !user_set_limit && log_item_count(&result.stdout, has_format_flag) > limit {
+        filtered.push_str(&log_cap_notice(limit));
+    }
     let filtered = never_worse(&result.stdout, &filtered).to_string();
     println!("{}", filtered);
 
@@ -619,6 +626,34 @@ pub(crate) fn filter_log_output(
     }
 
     result.join("\n").trim().to_string()
+}
+
+/// Count log items the way the renderer counts them.
+///
+/// With a user format each line is an item. Without one, rtk asked git for
+/// `---END---`-separated records, so a record is an item. Used to compare what
+/// git returned against what will be shown.
+pub(crate) fn log_item_count(output: &str, user_format: bool) -> usize {
+    if user_format {
+        output.lines().filter(|l| !l.trim().is_empty()).count()
+    } else {
+        output
+            .split("---END---")
+            .filter(|record| !record.trim().is_empty())
+            .count()
+    }
+}
+
+/// One line telling the model the history did not end where the output did.
+///
+/// rtk caps `git log` by injecting a limit into the git command, so the
+/// remainder is never produced and there is nothing to spill. Without this the
+/// model cannot tell a 50-commit repository from the first 3% of a large one.
+pub(crate) fn log_cap_notice(limit: usize) -> String {
+    format!(
+        "\n(rtk showed the {limit} most recent commits; history continues past them. \
+         Pass -N for a different count, or `rtk proxy git log …` for the full output.)"
+    )
 }
 
 /// Truncate a single line to `width` characters, appending "..." if needed
@@ -3320,6 +3355,34 @@ To https://github.com/foo/bar.git
             savings,
             input_tokens,
             output_tokens
+        );
+    }
+
+    #[test]
+    fn log_item_count_counts_lines_for_user_format() {
+        assert_eq!(log_item_count("a\nb\nc", true), 3);
+        assert_eq!(log_item_count("", true), 0);
+    }
+
+    #[test]
+    fn log_item_count_counts_records_for_rtk_format() {
+        let two = "abc subject (2 days ago) <me>\nbody\n---END---\ndef other (3 days ago) <me>\n---END---\n";
+        assert_eq!(log_item_count(two, false), 2);
+        assert_eq!(log_item_count("", false), 0);
+        assert_eq!(
+            log_item_count("---END---\n", false),
+            0,
+            "a trailing separator with no commit must not count as one"
+        );
+    }
+
+    #[test]
+    fn log_cap_notice_names_the_limit_and_a_way_out() {
+        let n = log_cap_notice(50);
+        assert!(n.contains("50"), "the notice must say how many were shown: {n}");
+        assert!(
+            n.contains("rtk proxy git log"),
+            "the notice must name a way to get the rest: {n}"
         );
     }
 }
