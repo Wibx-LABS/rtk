@@ -461,12 +461,14 @@ fn run_log(
         let n = parse_user_limit(args).unwrap_or(10);
         (n, true)
     } else if has_format_flag {
-        // --oneline / --pretty without -N: user wants compact output, allow more
-        cmd.arg("-50");
+        // --oneline / --pretty without -N: user wants compact output, allow more.
+        // One more than we show, so we can tell whether history continues without
+        // a second git invocation. The extra item is never rendered.
+        cmd.arg("-51");
         (50, false)
     } else {
-        // No flags at all: default to 10
-        cmd.arg("-10");
+        // No flags at all: default to 10, plus the same probe item.
+        cmd.arg("-11");
         (10, false)
     };
 
@@ -496,8 +498,7 @@ fn run_log(
     }
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
-    let filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
-    let filtered = never_worse(&result.stdout, &filtered).to_string();
+    let filtered = render_log(&result.stdout, limit, user_set_limit, has_format_flag);
     println!("{}", filtered);
 
     timer.track(
@@ -619,6 +620,55 @@ pub(crate) fn filter_log_output(
     }
 
     result.join("\n").trim().to_string()
+}
+
+/// Count log items the way the renderer counts them.
+///
+/// With a user format each line is an item. Without one, rtk asked git for
+/// `---END---`-separated records, so a record is an item. Used to compare what
+/// git returned against what will be shown.
+pub(crate) fn log_item_count(output: &str, user_format: bool) -> usize {
+    if user_format {
+        output.lines().filter(|l| !l.trim().is_empty()).count()
+    } else {
+        output
+            .split("---END---")
+            .filter(|record| !record.trim().is_empty())
+            .count()
+    }
+}
+
+/// One line telling the model the history did not end where the output did.
+///
+/// rtk caps `git log` by injecting a limit into the git command, so the
+/// remainder is never produced and there is nothing to spill. Without this the
+/// model cannot tell a 50-commit repository from the first 3% of a large one.
+pub(crate) fn log_cap_notice(limit: usize) -> String {
+    format!(
+        "\n(rtk showed the {limit} most recent commits; history continues past them. \
+         Pass -N for a different count, or `rtk proxy git log …` for the full output.)"
+    )
+}
+
+/// Render a captured `git log` result the way `run_log` emits it.
+///
+/// Owns the ordering that matters: the rendering is bounded by `never_worse`,
+/// and the cap notice is appended *after* that guard, never weighed by it —
+/// `result.stdout` is already capped by rtk's own `-N` injection, so it is not
+/// the unfiltered output `never_worse` assumes. Extracted from `run_log` so a
+/// test can exercise the real ordering instead of re-deriving it.
+pub(crate) fn render_log(
+    raw: &str,
+    limit: usize,
+    user_set_limit: bool,
+    has_format_flag: bool,
+) -> String {
+    let rendered = filter_log_output(raw, limit, user_set_limit, has_format_flag);
+    let mut out = never_worse(raw, &rendered).to_string();
+    if !user_set_limit && log_item_count(raw, has_format_flag) > limit {
+        out.push_str(&log_cap_notice(limit));
+    }
+    out
 }
 
 /// Truncate a single line to `width` characters, appending "..." if needed
@@ -3320,6 +3370,73 @@ To https://github.com/foo/bar.git
             savings,
             input_tokens,
             output_tokens
+        );
+    }
+
+    #[test]
+    fn log_item_count_counts_lines_for_user_format() {
+        assert_eq!(log_item_count("a\nb\nc", true), 3);
+        assert_eq!(log_item_count("", true), 0);
+    }
+
+    #[test]
+    fn log_item_count_counts_records_for_rtk_format() {
+        let two = "abc subject (2 days ago) <me>\nbody\n---END---\ndef other (3 days ago) <me>\n---END---\n";
+        assert_eq!(log_item_count(two, false), 2);
+        assert_eq!(log_item_count("", false), 0);
+        assert_eq!(
+            log_item_count("---END---\n", false),
+            0,
+            "a trailing separator with no commit must not count as one"
+        );
+    }
+
+    #[test]
+    fn log_cap_notice_names_the_limit_and_a_way_out() {
+        let n = log_cap_notice(50);
+        assert!(n.contains("50"), "the notice must say how many were shown: {n}");
+        assert!(
+            n.contains("rtk proxy git log"),
+            "the notice must name a way to get the rest: {n}"
+        );
+    }
+
+    #[test]
+    fn compact_format_still_gets_the_notice_despite_never_worse() {
+        // A bare date format makes the notice cost more than the capped raw output.
+        // When the notice was inside never_worse, the guard discarded it — showing
+        // one extra line and claiming nothing was missing. This calls the real
+        // rendering path, so moving the notice back inside never_worse fails here.
+        let raw: String = (0..51).map(|_| "2026-08-24\n").collect();
+        let out = render_log(&raw, 50, false, true);
+        assert!(
+            out.contains("history continues"),
+            "the notice must survive never_worse on a compact format: {out}"
+        );
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("2026")).count(),
+            50,
+            "exactly the cap should be rendered, not the probe item"
+        );
+    }
+
+    #[test]
+    fn render_log_stays_silent_when_the_user_set_the_limit() {
+        let raw: String = (0..51).map(|_| "2026-08-24\n").collect();
+        let out = render_log(&raw, 3, true, true);
+        assert!(
+            !out.contains("history continues"),
+            "an explicit -N was honoured exactly; nothing was withheld: {out}"
+        );
+    }
+
+    #[test]
+    fn render_log_stays_silent_when_history_is_shorter_than_the_cap() {
+        let raw = "2026-08-24\n2026-08-23\n".to_string();
+        let out = render_log(&raw, 50, false, true);
+        assert!(
+            !out.contains("history continues"),
+            "claiming truncation that did not happen is the opposite lie: {out}"
         );
     }
 }
