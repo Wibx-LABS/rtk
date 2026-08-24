@@ -498,13 +498,18 @@ fn run_log(
     }
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
-    let mut filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
-    // rtk set the limit and git had more to give: say so, or the model reads a
-    // capped history as a complete one.
+    let rendered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
+    let mut filtered = never_worse(&result.stdout, &rendered).to_string();
+    // The notice is metadata about what rtk withheld, not rendered content, so it
+    // is appended after never_worse rather than weighed by it. never_worse compares
+    // against result.stdout, which on this path rtk already capped via its own -N
+    // injection — so it is not the unfiltered output the guard assumes, and weighing
+    // the notice against it deletes the notice exactly when the output is most
+    // misleading. The rendering itself is still guarded: filter_log_output can only
+    // shrink its input, so the comparison above remains meaningful for that.
     if !user_set_limit && log_item_count(&result.stdout, has_format_flag) > limit {
         filtered.push_str(&log_cap_notice(limit));
     }
-    let filtered = never_worse(&result.stdout, &filtered).to_string();
     println!("{}", filtered);
 
     timer.track(
@@ -3383,6 +3388,28 @@ To https://github.com/foo/bar.git
         assert!(
             n.contains("rtk proxy git log"),
             "the notice must name a way to get the rest: {n}"
+        );
+    }
+
+    #[test]
+    fn compact_format_still_gets_the_notice_despite_never_worse() {
+        // A bare date format makes the notice cost more than the capped raw output,
+        // which previously made never_worse discard it — the output then showed one
+        // extra line and claimed nothing was missing. The notice must survive.
+        let raw: String = (0..51).map(|_| "2026-08-24\n").collect();
+        let rendered = filter_log_output(&raw, 50, false, true);
+        let mut out = never_worse(&raw, &rendered).to_string();
+        if log_item_count(&raw, true) > 50 {
+            out.push_str(&log_cap_notice(50));
+        }
+        assert!(
+            out.contains("history continues"),
+            "the notice must survive never_worse on a compact format: {out}"
+        );
+        assert_eq!(
+            log_item_count(&out, true),
+            51,
+            "50 rendered dates plus the one notice line"
         );
     }
 }
