@@ -452,7 +452,11 @@ fn run_log(
     // Use %b (body) to preserve first line of commit body for agent context
     // (BREAKING CHANGE, Closes #xxx, design notes)
     if !has_format_flag {
-        cmd.args(["--pretty=format:%h %s (%ar) <%an>%n%b%n---END---"]);
+        // -z makes git separate records with NUL instead of relying on a marker
+        // inside the text. Git refuses to write a commit message containing NUL,
+        // so unlike the previous "---END---" marker this delimiter cannot occur
+        // in a commit body and cannot split one record into several.
+        cmd.args(["-z", "--pretty=format:%h %s (%ar) <%an>%n%b"]);
     }
 
     // Determine limit: respect user's explicit -N flag, use sensible defaults otherwise
@@ -565,7 +569,7 @@ pub(crate) fn filter_log_output(
     let truncate_width = if user_set_limit { 120 } else { 80 };
 
     // When user specified their own format (--oneline, --pretty, --format),
-    // RTK did not inject ---END--- markers. Use simple line-based truncation.
+    // RTK did not inject a NUL separator. Use simple line-based truncation.
     if user_format {
         let lines: Vec<&str> = output.lines().collect();
         let max_lines = if user_set_limit { lines.len() } else { limit };
@@ -577,8 +581,11 @@ pub(crate) fn filter_log_output(
             .join("\n");
     }
 
-    // RTK injected format: split output into commit blocks separated by ---END---
-    let commits: Vec<&str> = output.split("---END---").collect();
+    // RTK injected format: git -z separated the records with NUL. A commit
+    // message cannot contain NUL, so a record can never split into fragments —
+    // which is what the previous "---END---" marker allowed, silently dropping
+    // real commits once the fragments pushed them past the limit below.
+    let commits: Vec<&str> = output.split('\0').collect();
     let max_commits = if user_set_limit { commits.len() } else { limit };
 
     let mut result = Vec::new();
@@ -625,14 +632,14 @@ pub(crate) fn filter_log_output(
 /// Count log items the way the renderer counts them.
 ///
 /// With a user format each line is an item. Without one, rtk asked git for
-/// `---END---`-separated records, so a record is an item. Used to compare what
+/// NUL-separated records, so a record is an item. Used to compare what
 /// git returned against what will be shown.
 pub(crate) fn log_item_count(output: &str, user_format: bool) -> usize {
     if user_format {
         output.lines().filter(|l| !l.trim().is_empty()).count()
     } else {
         output
-            .split("---END---")
+            .split('\0')
             .filter(|record| !record.trim().is_empty())
             .count()
     }
@@ -2663,7 +2670,7 @@ A  added.rs
 
     #[test]
     fn test_filter_log_output() {
-        let output = "abc1234 This is a commit message (2 days ago) <author>\n\n---END---\ndef5678 Another commit (1 week ago) <other>\n\n---END---\n";
+        let output = "abc1234 This is a commit message (2 days ago) <author>\n\n\0def5678 Another commit (1 week ago) <other>\n\n\0";
         let result = filter_log_output(output, 10, false, false);
         assert!(result.contains("abc1234"));
         assert!(result.contains("def5678"));
@@ -2673,7 +2680,7 @@ A  added.rs
     #[test]
     fn test_filter_log_output_with_body() {
         // Commit with body: first non-trailer body line should appear indented
-        let output = "abc1234 feat: add feature (2 days ago) <author>\nBREAKING CHANGE: removed old API\nSigned-off-by: Author <a@b.com>\n---END---\ndef5678 fix: typo (1 day ago) <other>\n\n---END---\n";
+        let output = "abc1234 feat: add feature (2 days ago) <author>\nBREAKING CHANGE: removed old API\nSigned-off-by: Author <a@b.com>\n\0def5678 fix: typo (1 day ago) <other>\n\n\0";
         let result = filter_log_output(output, 10, false, false);
         assert!(result.contains("abc1234"));
         assert!(result.contains("BREAKING CHANGE: removed old API"));
@@ -2687,7 +2694,7 @@ A  added.rs
     #[test]
     fn test_filter_log_output_skips_trailers() {
         // Body with only trailers should not produce a body line
-        let output = "abc1234 chore: bump (1 day ago) <bot>\nSigned-off-by: Bot <bot@ci>\nCo-authored-by: Human <h@b>\n---END---\n";
+        let output = "abc1234 chore: bump (1 day ago) <bot>\nSigned-off-by: Bot <bot@ci>\nCo-authored-by: Human <h@b>\n\0";
         let result = filter_log_output(output, 10, false, false);
         assert!(result.contains("abc1234"));
         assert!(!result.contains("Signed-off-by:"));
@@ -2707,7 +2714,7 @@ A  added.rs
     #[test]
     fn test_filter_log_output_cap_lines() {
         let output = (0..20)
-            .map(|i| format!("hash{} message {} (1 day ago) <author>\n\n---END---", i, i))
+            .map(|i| format!("hash{} message {} (1 day ago) <author>\n\n\0", i, i))
             .collect::<Vec<_>>()
             .join("\n");
         let result = filter_log_output(&output, 5, false, false);
@@ -2715,10 +2722,49 @@ A  added.rs
     }
 
     #[test]
+    fn a_commit_body_containing_the_old_delimiter_does_not_drop_commits() {
+        // Regression: rtk used to separate records with the literal "---END---".
+        // A commit body containing that text split into extra fragments, and the
+        // renderer's take(limit) then discarded real commits — five in, three out,
+        // with no error and no notice. NUL cannot appear in a commit message at
+        // all (git rejects it at write time), so the collision class is gone.
+        let mut raw = String::new();
+        for i in (1..=5).rev() {
+            raw.push_str(&format!("hash{i} commit {i} (1 day ago) <t>\n"));
+            if i == 3 {
+                for _ in 0..8 {
+                    raw.push_str("---END---\n");
+                }
+            }
+            if i > 1 {
+                raw.push('\0');
+            }
+        }
+
+        assert_eq!(
+            log_item_count(&raw, false),
+            5,
+            "five records must be counted despite the old delimiter appearing in a body"
+        );
+
+        // limit 5, not 10: with 8 fragments the broken split yields 9 blocks and
+        // take(10) still reaches every commit, so a larger limit makes this test
+        // pass either way. At take(5) the fragments push commits 1 and 2 out —
+        // the real symptom, five commits in and three rendered.
+        let out = filter_log_output(&raw, 5, false, false);
+        for i in 1..=5 {
+            assert!(
+                out.contains(&format!("commit {i}")),
+                "commit {i} was dropped: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn test_filter_log_output_user_limit_no_cap() {
         // When user explicitly passes -N, all N lines should be returned (no re-truncation)
         let output = (0..20)
-            .map(|i| format!("hash{} message {} (1 day ago) <author>\n\n---END---", i, i))
+            .map(|i| format!("hash{} message {} (1 day ago) <author>\n\n\0", i, i))
             .collect::<Vec<_>>()
             .join("\n");
         let result = filter_log_output(&output, 20, true, false);
@@ -2958,7 +3004,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     }
 
     /// Regression test: --oneline and other user format flags must preserve all commits.
-    /// Before fix, filter_log_output split on ---END--- which doesn't exist when
+    /// Before fix, filter_log_output split on NUL which doesn't exist when
     /// the user specifies their own format, resulting in only 2 commits surviving.
     #[test]
     fn test_filter_log_output_user_format_oneline() {
@@ -2969,7 +3015,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
                               mno7890 test: add tests\n";
 
         let result = filter_log_output(oneline_output, 10, false, true);
-        // All 5 lines must survive — no ---END--- splitting
+        // All 5 lines must survive — no NUL splitting
         assert_eq!(result.lines().count(), 5);
         assert!(result.contains("abc1234"));
         assert!(result.contains("mno7890"));
@@ -3243,7 +3289,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
             .collect::<Vec<_>>()
             .join("\n");
         let output = format!(
-            "abc1234 feat: big change (1 day ago) <author>\n{}\n---END---\n",
+            "abc1234 feat: big change (1 day ago) <author>\n{}\n\0",
             body_lines
         );
         let result = filter_log_output(&output, 10, false, false);
@@ -3381,11 +3427,11 @@ To https://github.com/foo/bar.git
 
     #[test]
     fn log_item_count_counts_records_for_rtk_format() {
-        let two = "abc subject (2 days ago) <me>\nbody\n---END---\ndef other (3 days ago) <me>\n---END---\n";
+        let two = "abc subject (2 days ago) <me>\nbody\n\0def other (3 days ago) <me>\n\0";
         assert_eq!(log_item_count(two, false), 2);
         assert_eq!(log_item_count("", false), 0);
         assert_eq!(
-            log_item_count("---END---\n", false),
+            log_item_count("\0", false),
             0,
             "a trailing separator with no commit must not count as one"
         );
