@@ -1982,44 +1982,86 @@ mod tests {
 
         // Timestamps are inserted directly so the test controls the window
         // without sleeping. Column order matches the production INSERT.
-        let insert = |ts: &str, cmd: &str, loss: &str, input: i64| {
+        // input_tokens and saved_tokens are deliberately DIFFERENT: they were
+        // once the same value, which let `SUM(b.input_tokens)` pass this test
+        // just as well as the correct `SUM(b.saved_tokens)`.
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64, saved: i64| {
             tracker.conn.execute(
                 "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
-                 VALUES (?1, ?2, ?2, '', ?4, 0, ?4, 100.0, 1, ?3)",
-                params![ts, cmd, loss, input],
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?5, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input, saved],
             ).unwrap();
         };
 
         // lossy, then the same command 2 minutes later -> counts
-        insert("2026-08-24T10:00:00+00:00", "rtk:toml df -h", "tail", 500);
-        insert("2026-08-24T10:02:00+00:00", "rtk:toml df -h", "tail", 500);
+        insert(
+            "2026-08-24T10:00:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+        insert(
+            "2026-08-24T10:02:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
         // lossless, then repeated -> does not count
-        insert("2026-08-24T11:00:00+00:00", "rtk:toml ps", "none", 300);
-        insert("2026-08-24T11:01:00+00:00", "rtk:toml ps", "none", 300);
+        insert("2026-08-24T11:00:00+00:00", "rtk:toml ps", "none", 300, 270);
+        insert("2026-08-24T11:01:00+00:00", "rtk:toml ps", "none", 300, 270);
         // lossy, but the repeat is far outside the window -> does not count
-        insert("2026-08-24T12:00:00+00:00", "rtk:toml du", "whole", 700);
-        insert("2026-08-24T14:00:00+00:00", "rtk:toml du", "whole", 700);
+        insert(
+            "2026-08-24T12:00:00+00:00",
+            "rtk:toml du",
+            "whole",
+            700,
+            630,
+        );
+        insert(
+            "2026-08-24T14:00:00+00:00",
+            "rtk:toml du",
+            "whole",
+            700,
+            630,
+        );
 
         let s = tracker.rerun_stats(None).unwrap();
         assert_eq!(s.lossy_followed_by_repeat, 1);
-        assert_eq!(s.repeat_saved_tokens, 500);
+        assert_eq!(
+            s.repeat_saved_tokens, 450,
+            "must be the repeat's saved_tokens (450), not its input_tokens (500)"
+        );
     }
 
     #[test]
     fn rerun_stats_window_boundary_is_inclusive() {
         let tracker = Tracker::new_in_memory().unwrap();
 
-        let insert = |ts: &str, cmd: &str, loss: &str, input: i64| {
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64, saved: i64| {
             tracker.conn.execute(
                 "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
-                 VALUES (?1, ?2, ?2, '', ?4, 0, ?4, 100.0, 1, ?3)",
-                params![ts, cmd, loss, input],
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?5, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input, saved],
             ).unwrap();
         };
 
         // Exactly RERUN_WINDOW_MINUTES apart -> must still count.
-        insert("2026-08-24T10:00:00+00:00", "rtk:toml df -h", "tail", 500);
-        insert("2026-08-24T10:10:00+00:00", "rtk:toml df -h", "tail", 500);
+        insert(
+            "2026-08-24T10:00:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+        insert(
+            "2026-08-24T10:10:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
 
         let s = tracker.rerun_stats(None).unwrap();
         assert_eq!(
