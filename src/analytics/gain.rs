@@ -178,6 +178,15 @@ pub fn run(
                 loss.total,
                 loss.unknown
             );
+
+            let rerun = tracker.rerun_stats(project_scope.as_deref())?;
+            if rerun.lossy_followed_by_repeat > 0 {
+                println!(
+                    "  {} lossy results were re-run within 10 min, costing {} input tokens back",
+                    rerun.lossy_followed_by_repeat,
+                    format_tokens(rerun.repeat_input_tokens)
+                );
+            }
         }
 
         if !summary.by_command.is_empty() {

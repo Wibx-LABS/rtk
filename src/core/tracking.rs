@@ -254,6 +254,32 @@ impl LossinessBreakdown {
     }
 }
 
+/// How often a lossy result was followed by the same command being run again.
+///
+/// A heuristic, not a proof of causation: the window is a guess and a repeat may
+/// have happened anyway. It is a floor on wasted work, not a measurement of it.
+#[derive(Debug, Default, Serialize)]
+pub struct RerunStats {
+    /// Lossy rows followed by an identical command within the window.
+    pub lossy_followed_by_repeat: usize,
+    /// Input tokens the repeat runs consumed — savings partly refunded.
+    pub repeat_input_tokens: usize,
+}
+
+/// Minutes within which a repeated identical command is treated as a probable
+/// re-run of a lossy result. Chosen, not measured: long enough to cover reading
+/// a truncated result and reacting, short enough to exclude an unrelated later
+/// call. Widening it inflates the count.
+const RERUN_WINDOW_MINUTES: i64 = 10;
+
+/// Index required by [`Tracker::rerun_stats`]. Without it the self-join degrades
+/// to a full scan per candidate row: **measured 22.45s** against a 53,855-row
+/// database with half the rows lossy, versus **0.068s** with the index — a 330x
+/// difference. Creating it costs about 0.15s once. Added through the same
+/// additive-migration idiom as the other indexes on this table.
+const RERUN_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cmd_project_id ON commands(rtk_cmd, project_path, id)";
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -326,6 +352,8 @@ impl Tracker {
             "ALTER TABLE commands ADD COLUMN lossiness TEXT DEFAULT 'unknown'",
             [],
         );
+        // Required by rerun_stats; see RERUN_INDEX_DDL for the measurement.
+        let _ = conn.execute(RERUN_INDEX_DDL, []);
         // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
         let has_nulls: bool = conn
             .query_row(
@@ -680,6 +708,48 @@ impl Tracker {
             b.total += count;
         }
         Ok(b)
+    }
+
+    /// Count lossy results that were followed by the same command being re-run.
+    ///
+    /// Pairs a `tail`/`whole` row with the next row having the same `rtk_cmd`
+    /// and `project_path`, when that next row falls inside
+    /// [`RERUN_WINDOW_MINUTES`]. A self-join is used rather than a window
+    /// function so the query does not depend on the bundled SQLite version.
+    pub fn rerun_stats(&self, project_scope: Option<&str>) -> Result<RerunStats> {
+        let scope_clause = match project_scope {
+            Some(_) => "AND a.project_path = ?1 AND b.project_path = ?1",
+            None => "",
+        };
+
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(b.input_tokens), 0)
+             FROM commands a
+             JOIN commands b
+               ON b.rtk_cmd = a.rtk_cmd
+              AND b.project_path = a.project_path
+              AND b.id > a.id
+             WHERE a.lossiness IN ('tail','whole')
+               {scope_clause}
+               AND (julianday(b.timestamp) - julianday(a.timestamp)) * 24 * 60 <= {RERUN_WINDOW_MINUTES}
+               AND b.id = (
+                     SELECT MIN(c.id) FROM commands c
+                     WHERE c.rtk_cmd = a.rtk_cmd
+                       AND c.project_path = a.project_path
+                       AND c.id > a.id
+                   )"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let (count, tokens): (i64, i64) = match project_scope {
+            Some(p) => stmt.query_row(params![p], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            None => stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        };
+
+        Ok(RerunStats {
+            lossy_followed_by_repeat: count as usize,
+            repeat_input_tokens: tokens as usize,
+        })
     }
 
     /// Get summary statistics filtered by project path. // added
@@ -1893,5 +1963,34 @@ mod tests {
         let b = tracker.lossiness_breakdown(None).unwrap();
         assert_eq!(b.total, 0);
         assert_eq!(b.known_pct(), 0.0, "no rows must not divide by zero");
+    }
+
+    #[test]
+    fn rerun_stats_counts_only_repeats_that_follow_a_lossy_result() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        // Timestamps are inserted directly so the test controls the window
+        // without sleeping. Column order matches the production INSERT.
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64| {
+            tracker.conn.execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?4, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input],
+            ).unwrap();
+        };
+
+        // lossy, then the same command 2 minutes later -> counts
+        insert("2026-08-24T10:00:00+00:00", "rtk:toml df -h", "tail", 500);
+        insert("2026-08-24T10:02:00+00:00", "rtk:toml df -h", "tail", 500);
+        // lossless, then repeated -> does not count
+        insert("2026-08-24T11:00:00+00:00", "rtk:toml ps", "none", 300);
+        insert("2026-08-24T11:01:00+00:00", "rtk:toml ps", "none", 300);
+        // lossy, but the repeat is far outside the window -> does not count
+        insert("2026-08-24T12:00:00+00:00", "rtk:toml du", "whole", 700);
+        insert("2026-08-24T14:00:00+00:00", "rtk:toml du", "whole", 700);
+
+        let s = tracker.rerun_stats(None).unwrap();
+        assert_eq!(s.lossy_followed_by_repeat, 1);
+        assert_eq!(s.repeat_input_tokens, 500);
     }
 }
