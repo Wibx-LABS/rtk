@@ -512,6 +512,22 @@ pub enum Lossiness {
     Whole,
 }
 
+impl Lossiness {
+    /// Stable string written to the `commands.lossiness` column.
+    ///
+    /// The variant payloads are deliberately dropped: the tee file already holds
+    /// the dropped text, and the tracking DB stores analytics, not content. These
+    /// strings are a persisted format — changing one silently reinterprets every
+    /// historical row, so treat them as fixed.
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Lossiness::None => "none",
+            Lossiness::Tail { .. } => "tail",
+            Lossiness::Whole => "whole",
+        }
+    }
+}
+
 pub fn apply_filter_with_info(filter: &CompiledFilter, stdout: &str) -> (String, Lossiness) {
     let mut lines: Vec<String> = stdout.lines().map(String::from).collect();
 
@@ -1968,5 +1984,19 @@ expected = "output line 1\noutput line 2"
             "Newly added filter must be discoverable via find_filter_in"
         );
         assert_eq!(found.unwrap().name, "my-new-tool");
+    }
+
+    #[test]
+    fn lossiness_db_encoding_is_stable() {
+        assert_eq!(Lossiness::None.as_db_str(), "none");
+        assert_eq!(Lossiness::Whole.as_db_str(), "whole");
+        assert_eq!(
+            Lossiness::Tail {
+                tee_payload: String::new(),
+                tail_offset: 1,
+            }
+            .as_db_str(),
+            "tail"
+        );
     }
 }

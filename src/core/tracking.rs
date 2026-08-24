@@ -223,6 +223,67 @@ pub struct MonthStats {
 /// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
 type CommandStats = (String, usize, usize, f64, u64);
 
+/// Counts of recorded commands by how much output their filter dropped.
+///
+/// `unknown` is not a failure state: it is every call site that computes no
+/// `Lossiness`, which today is most of them. `known_pct` exists so a caller
+/// cannot present the other buckets as if they described all traffic.
+#[derive(Debug, Default, Serialize)]
+pub struct LossinessBreakdown {
+    /// Filter provably dropped nothing.
+    pub none: usize,
+    /// Filter kept a head and dropped a recoverable tail.
+    pub tail: usize,
+    /// Filter replaced the whole output.
+    pub whole: usize,
+    /// Call site recorded no lossiness.
+    pub unknown: usize,
+    /// All recorded commands in scope.
+    pub total: usize,
+    /// Tokens booked as saved by rows that dropped output (`tail` + `whole`).
+    pub saved_tokens_in_lossy: usize,
+}
+
+impl LossinessBreakdown {
+    /// Percentage of commands whose lossiness is actually known. Zero when empty.
+    pub fn known_pct(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        ((self.total - self.unknown) as f64 / self.total as f64) * 100.0
+    }
+}
+
+/// How often a lossy result was followed by the same command being run again.
+///
+/// A heuristic, not a proof of causation: the window is a guess and a repeat may
+/// have happened anyway. The **count** is a floor on wasted work. The token figure
+/// is the saving those repeats re-booked, which reconciles against the headline
+/// total — not a measure of context delivered.
+#[derive(Debug, Default, Serialize)]
+pub struct RerunStats {
+    /// Lossy rows followed by an identical command within the window.
+    pub lossy_followed_by_repeat: usize,
+    /// Saving that a repeat re-booked: the repeat run's own `saved_tokens`.
+    /// This is the portion of the headline total that was claimed twice for the
+    /// same information.
+    pub repeat_saved_tokens: usize,
+}
+
+/// Minutes within which a repeated identical command is treated as a probable
+/// re-run of a lossy result. Chosen, not measured: long enough to cover reading
+/// a truncated result and reacting, short enough to exclude an unrelated later
+/// call. Widening it inflates the count.
+pub const RERUN_WINDOW_MINUTES: i64 = 10;
+
+/// Index required by [`Tracker::rerun_stats`]. Without it the self-join degrades
+/// to a full scan per candidate row: **measured 22.45s** against a 53,855-row
+/// database with half the rows lossy, versus **0.068s** with the index — a 330x
+/// difference. Creating it costs about 0.15s once. Added through the same
+/// additive-migration idiom as the other indexes on this table.
+const RERUN_INDEX_DDL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_cmd_project_id ON commands(rtk_cmd, project_path, id)";
+
 impl Tracker {
     /// Create a new tracker instance.
     ///
@@ -288,6 +349,15 @@ impl Tracker {
             "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
             [],
         );
+        // Migration: add lossiness column. 'unknown' is truthful for every row
+        // written before this column existed and for every call site that does
+        // not compute a Lossiness — see record_with_loss.
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN lossiness TEXT DEFAULT 'unknown'",
+            [],
+        );
+        // Required by rerun_stats; see RERUN_INDEX_DDL for the measurement.
+        let _ = conn.execute(RERUN_INDEX_DDL, []);
         // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
         let has_nulls: bool = conn
             .query_row(
@@ -348,7 +418,8 @@ impl Tracker {
                 saved_tokens INTEGER NOT NULL,
                 savings_pct REAL NOT NULL,
                 exec_time_ms INTEGER DEFAULT 0,
-                project_path TEXT DEFAULT ''
+                project_path TEXT DEFAULT '',
+                lossiness TEXT DEFAULT 'unknown'
             )",
             [],
         )?;
@@ -360,6 +431,8 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
             [],
         )?;
+        // Required by rerun_stats; see RERUN_INDEX_DDL for the measurement.
+        self.conn.execute(RERUN_INDEX_DDL, [])?;
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
                 id INTEGER PRIMARY KEY,
@@ -407,6 +480,33 @@ impl Tracker {
         output_tokens: usize,
         exec_time_ms: u64,
     ) -> Result<()> {
+        // `unknown`, not `none`: this call site did not compute a Lossiness, so
+        // nothing here knows whether output was dropped. Recording `none` would
+        // report ~92% of traffic as provably lossless, which is false.
+        self.record_with_loss(
+            original_cmd,
+            rtk_cmd,
+            input_tokens,
+            output_tokens,
+            exec_time_ms,
+            "unknown",
+        )
+    }
+
+    /// Record a command whose caller knows how lossy the filtering was.
+    ///
+    /// `lossiness` is one of `none`, `tail`, `whole`, `unknown` — the strings
+    /// produced by `Lossiness::as_db_str`, plus `unknown` for call sites that
+    /// compute no Lossiness.
+    pub fn record_with_loss(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+        lossiness: &str,
+    ) -> Result<()> {
         let saved = input_tokens.saturating_sub(output_tokens);
         let pct = if input_tokens > 0 {
             (saved as f64 / input_tokens as f64) * 100.0
@@ -414,21 +514,22 @@ impl Tracker {
             0.0
         };
 
-        let project_path = current_project_path_string(); // added: record cwd
+        let project_path = current_project_path_string();
 
         self.conn.execute(
-            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", // added: project_path
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 Utc::now().to_rfc3339(),
                 original_cmd,
                 rtk_cmd,
-                project_path, // added
+                project_path,
                 input_tokens as i64,
                 output_tokens as i64,
                 saved as i64,
                 pct,
-                exec_time_ms as i64
+                exec_time_ms as i64,
+                lossiness
             ],
         )?;
 
@@ -563,6 +664,95 @@ impl Tracker {
     #[allow(dead_code)]
     pub fn get_summary(&self) -> Result<GainSummary> {
         self.get_summary_filtered(None) // delegate to filtered variant
+    }
+
+    /// Count recorded commands by lossiness bucket, optionally scoped to a project.
+    ///
+    /// Rows written before the `lossiness` column existed read as `unknown`
+    /// through the column default; a NULL is also folded into `unknown` so a
+    /// database migrated by an older build cannot silently vanish from the total.
+    pub fn lossiness_breakdown(&self, project_scope: Option<&str>) -> Result<LossinessBreakdown> {
+        let (clause, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &project_scope {
+            Some(p) => ("WHERE project_path = ?1", vec![p]),
+            None => ("", vec![]),
+        };
+
+        let sql = format!(
+            "SELECT COALESCE(lossiness, 'unknown') AS l, COUNT(*), SUM(saved_tokens)
+             FROM commands {clause} GROUP BY l"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0) as usize,
+            ))
+        })?;
+
+        let mut b = LossinessBreakdown::default();
+        for row in rows {
+            let (bucket, count, saved) = row?;
+            match bucket.as_str() {
+                "none" => b.none = count,
+                "tail" => {
+                    b.tail = count;
+                    b.saved_tokens_in_lossy += saved;
+                }
+                "whole" => {
+                    b.whole = count;
+                    b.saved_tokens_in_lossy += saved;
+                }
+                // Any unrecognized value is counted as unknown rather than
+                // dropped, so `total` always equals the row count.
+                _ => b.unknown += count,
+            }
+            b.total += count;
+        }
+        Ok(b)
+    }
+
+    /// Count lossy results that were followed by the same command being re-run.
+    ///
+    /// Pairs a `tail`/`whole` row with the next row having the same `rtk_cmd`
+    /// and `project_path`, when that next row falls inside
+    /// [`RERUN_WINDOW_MINUTES`]. A self-join is used rather than a window
+    /// function so the query does not depend on the bundled SQLite version.
+    pub fn rerun_stats(&self, project_scope: Option<&str>) -> Result<RerunStats> {
+        let scope_clause = match project_scope {
+            Some(_) => "AND a.project_path = ?1 AND b.project_path = ?1",
+            None => "",
+        };
+
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(b.saved_tokens), 0)
+             FROM commands a
+             JOIN commands b
+               ON b.rtk_cmd = a.rtk_cmd
+              AND b.project_path = a.project_path
+              AND b.id > a.id
+             WHERE a.lossiness IN ('tail','whole')
+               {scope_clause}
+               AND (CAST(strftime('%s', b.timestamp) AS INTEGER) - CAST(strftime('%s', a.timestamp) AS INTEGER)) <= {RERUN_WINDOW_MINUTES} * 60
+               AND b.id = (
+                     SELECT MIN(c.id) FROM commands c
+                     WHERE c.rtk_cmd = a.rtk_cmd
+                       AND c.project_path = a.project_path
+                       AND c.id > a.id
+                   )"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let (count, tokens): (i64, i64) = match project_scope {
+            Some(p) => stmt.query_row(params![p], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            None => stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        };
+
+        Ok(RerunStats {
+            lossy_followed_by_repeat: count as usize,
+            repeat_saved_tokens: tokens as usize,
+        })
     }
 
     /// Get summary statistics filtered by project path. // added
@@ -1369,6 +1559,42 @@ impl TimedExecution {
         }
     }
 
+    /// Track a command whose caller computed a `Lossiness`.
+    ///
+    /// Identical to [`track`](Self::track) except that the caller states how much
+    /// output was dropped. Use `Lossiness::as_db_str()` for the value.
+    ///
+    /// # Arguments
+    ///
+    /// - `original_cmd`: Standard command (e.g., "df -h")
+    /// - `rtk_cmd`: RTK command used (e.g., "rtk:toml df -h")
+    /// - `input`: Standard command output (for token estimation)
+    /// - `output`: RTK command output (for token estimation)
+    /// - `lossiness`: `none`, `tail`, `whole`, or `unknown`
+    pub fn track_with_loss(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input: &str,
+        output: &str,
+        lossiness: &str,
+    ) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let input_tokens = estimate_tokens(input);
+        let output_tokens = estimate_tokens(output);
+
+        if let Ok(tracker) = Tracker::new() {
+            let _ = tracker.record_with_loss(
+                original_cmd,
+                rtk_cmd,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+                lossiness,
+            );
+        }
+    }
+
     /// Track passthrough commands (timing-only, no token counting).
     ///
     /// For commands that stream output or run interactively where output
@@ -1684,6 +1910,163 @@ mod tests {
         assert_eq!(
             failures.total, 0,
             "parse_failures table should be empty after reset"
+        );
+    }
+
+    #[test]
+    fn record_with_loss_persists_the_value_and_record_defaults_to_unknown() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        tracker
+            .record_with_loss("df -h", "rtk:toml df -h", 100, 10, 5, "tail")
+            .unwrap();
+        tracker
+            .record("git status", "rtk git status", 100, 10, 5)
+            .unwrap();
+
+        let mut stmt = tracker
+            .conn
+            .prepare("SELECT rtk_cmd, lossiness FROM commands ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows[0], ("rtk:toml df -h".to_string(), "tail".to_string()));
+        assert_eq!(
+            rows[1],
+            ("rtk git status".to_string(), "unknown".to_string()),
+            "an uninstrumented call site must record `unknown`, never `none` — \
+             claiming a hand-written filter was lossless would be a lie"
+        );
+    }
+
+    #[test]
+    fn lossiness_breakdown_counts_each_bucket_and_lossy_savings() {
+        let tracker = Tracker::new_in_memory().unwrap();
+        tracker
+            .record_with_loss("a", "rtk:toml a", 100, 10, 1, "none")
+            .unwrap();
+        tracker
+            .record_with_loss("b", "rtk:toml b", 100, 10, 1, "tail")
+            .unwrap();
+        tracker
+            .record_with_loss("c", "rtk:toml c", 200, 20, 1, "whole")
+            .unwrap();
+        tracker.record("d", "rtk git status", 100, 10, 1).unwrap();
+
+        let b = tracker.lossiness_breakdown(None).unwrap();
+        assert_eq!(b.none, 1);
+        assert_eq!(b.tail, 1);
+        assert_eq!(b.whole, 1);
+        assert_eq!(b.unknown, 1);
+        assert_eq!(b.total, 4);
+        // savings booked by rows that dropped output: (100-10) + (200-20)
+        assert_eq!(b.saved_tokens_in_lossy, 270);
+        assert_eq!(b.known_pct().round() as i64, 75);
+    }
+
+    #[test]
+    fn lossiness_breakdown_is_empty_safe() {
+        let tracker = Tracker::new_in_memory().unwrap();
+        let b = tracker.lossiness_breakdown(None).unwrap();
+        assert_eq!(b.total, 0);
+        assert_eq!(b.known_pct(), 0.0, "no rows must not divide by zero");
+    }
+
+    #[test]
+    fn rerun_stats_counts_only_repeats_that_follow_a_lossy_result() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        // Timestamps are inserted directly so the test controls the window
+        // without sleeping. Column order matches the production INSERT.
+        // input_tokens and saved_tokens are deliberately DIFFERENT: they were
+        // once the same value, which let `SUM(b.input_tokens)` pass this test
+        // just as well as the correct `SUM(b.saved_tokens)`.
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64, saved: i64| {
+            tracker.conn.execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?5, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input, saved],
+            ).unwrap();
+        };
+
+        // lossy, then the same command 2 minutes later -> counts
+        insert(
+            "2026-08-24T10:00:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+        insert(
+            "2026-08-24T10:02:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+        // lossless, then repeated -> does not count
+        insert("2026-08-24T11:00:00+00:00", "rtk:toml ps", "none", 300, 270);
+        insert("2026-08-24T11:01:00+00:00", "rtk:toml ps", "none", 300, 270);
+        // lossy, but the repeat is far outside the window -> does not count
+        insert(
+            "2026-08-24T12:00:00+00:00",
+            "rtk:toml du",
+            "whole",
+            700,
+            630,
+        );
+        insert(
+            "2026-08-24T14:00:00+00:00",
+            "rtk:toml du",
+            "whole",
+            700,
+            630,
+        );
+
+        let s = tracker.rerun_stats(None).unwrap();
+        assert_eq!(s.lossy_followed_by_repeat, 1);
+        assert_eq!(
+            s.repeat_saved_tokens, 450,
+            "must be the repeat's saved_tokens (450), not its input_tokens (500)"
+        );
+    }
+
+    #[test]
+    fn rerun_stats_window_boundary_is_inclusive() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64, saved: i64| {
+            tracker.conn.execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?5, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input, saved],
+            ).unwrap();
+        };
+
+        // Exactly RERUN_WINDOW_MINUTES apart -> must still count.
+        insert(
+            "2026-08-24T10:00:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+        insert(
+            "2026-08-24T10:10:00+00:00",
+            "rtk:toml df -h",
+            "tail",
+            500,
+            450,
+        );
+
+        let s = tracker.rerun_stats(None).unwrap();
+        assert_eq!(
+            s.lossy_followed_by_repeat, 1,
+            "a gap of exactly RERUN_WINDOW_MINUTES must be inclusive"
         );
     }
 }
