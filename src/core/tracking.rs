@@ -288,6 +288,13 @@ impl Tracker {
             "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
             [],
         );
+        // Migration: add lossiness column. 'unknown' is truthful for every row
+        // written before this column existed and for every call site that does
+        // not compute a Lossiness — see record_with_loss.
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN lossiness TEXT DEFAULT 'unknown'",
+            [],
+        );
         // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
         let has_nulls: bool = conn
             .query_row(
@@ -348,7 +355,8 @@ impl Tracker {
                 saved_tokens INTEGER NOT NULL,
                 savings_pct REAL NOT NULL,
                 exec_time_ms INTEGER DEFAULT 0,
-                project_path TEXT DEFAULT ''
+                project_path TEXT DEFAULT '',
+                lossiness TEXT DEFAULT 'unknown'
             )",
             [],
         )?;
@@ -407,6 +415,33 @@ impl Tracker {
         output_tokens: usize,
         exec_time_ms: u64,
     ) -> Result<()> {
+        // `unknown`, not `none`: this call site did not compute a Lossiness, so
+        // nothing here knows whether output was dropped. Recording `none` would
+        // report ~92% of traffic as provably lossless, which is false.
+        self.record_with_loss(
+            original_cmd,
+            rtk_cmd,
+            input_tokens,
+            output_tokens,
+            exec_time_ms,
+            "unknown",
+        )
+    }
+
+    /// Record a command whose caller knows how lossy the filtering was.
+    ///
+    /// `lossiness` is one of `none`, `tail`, `whole`, `unknown` — the strings
+    /// produced by `Lossiness::as_db_str`, plus `unknown` for call sites that
+    /// compute no Lossiness.
+    pub fn record_with_loss(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+        lossiness: &str,
+    ) -> Result<()> {
         let saved = input_tokens.saturating_sub(output_tokens);
         let pct = if input_tokens > 0 {
             (saved as f64 / input_tokens as f64) * 100.0
@@ -414,21 +449,22 @@ impl Tracker {
             0.0
         };
 
-        let project_path = current_project_path_string(); // added: record cwd
+        let project_path = current_project_path_string();
 
         self.conn.execute(
-            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", // added: project_path
+            "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 Utc::now().to_rfc3339(),
                 original_cmd,
                 rtk_cmd,
-                project_path, // added
+                project_path,
                 input_tokens as i64,
                 output_tokens as i64,
                 saved as i64,
                 pct,
-                exec_time_ms as i64
+                exec_time_ms as i64,
+                lossiness
             ],
         )?;
 
@@ -1369,6 +1405,45 @@ impl TimedExecution {
         }
     }
 
+    /// Track a command whose caller computed a `Lossiness`.
+    ///
+    /// Identical to [`track`](Self::track) except that the caller states how much
+    /// output was dropped. Use `Lossiness::as_db_str()` for the value.
+    ///
+    /// # Arguments
+    ///
+    /// - `original_cmd`: Standard command (e.g., "df -h")
+    /// - `rtk_cmd`: RTK command used (e.g., "rtk:toml df -h")
+    /// - `input`: Standard command output (for token estimation)
+    /// - `output`: RTK command output (for token estimation)
+    /// - `lossiness`: `none`, `tail`, `whole`, or `unknown`
+    // allow(dead_code): no call site until Task 2 (R4-lossiness-accounting) wires
+    // this in at the TOML-filter dispatch site. Remove this attribute in Task 2.
+    #[allow(dead_code)]
+    pub fn track_with_loss(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input: &str,
+        output: &str,
+        lossiness: &str,
+    ) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let input_tokens = estimate_tokens(input);
+        let output_tokens = estimate_tokens(output);
+
+        if let Ok(tracker) = Tracker::new() {
+            let _ = tracker.record_with_loss(
+                original_cmd,
+                rtk_cmd,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+                lossiness,
+            );
+        }
+    }
+
     /// Track passthrough commands (timing-only, no token counting).
     ///
     /// For commands that stream output or run interactively where output
@@ -1684,6 +1759,34 @@ mod tests {
         assert_eq!(
             failures.total, 0,
             "parse_failures table should be empty after reset"
+        );
+    }
+
+    #[test]
+    fn record_with_loss_persists_the_value_and_record_defaults_to_unknown() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        tracker
+            .record_with_loss("df -h", "rtk:toml df -h", 100, 10, 5, "tail")
+            .unwrap();
+        tracker.record("git status", "rtk git status", 100, 10, 5).unwrap();
+
+        let mut stmt = tracker
+            .conn
+            .prepare("SELECT rtk_cmd, lossiness FROM commands ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows[0], ("rtk:toml df -h".to_string(), "tail".to_string()));
+        assert_eq!(
+            rows[1],
+            ("rtk git status".to_string(), "unknown".to_string()),
+            "an uninstrumented call site must record `unknown`, never `none` — \
+             claiming a hand-written filter was lossless would be a lie"
         );
     }
 }
