@@ -257,20 +257,24 @@ impl LossinessBreakdown {
 /// How often a lossy result was followed by the same command being run again.
 ///
 /// A heuristic, not a proof of causation: the window is a guess and a repeat may
-/// have happened anyway. It is a floor on wasted work, not a measurement of it.
+/// have happened anyway. The **count** is a floor on wasted work. The token figure
+/// is the saving those repeats re-booked, which reconciles against the headline
+/// total — not a measure of context delivered.
 #[derive(Debug, Default, Serialize)]
 pub struct RerunStats {
     /// Lossy rows followed by an identical command within the window.
     pub lossy_followed_by_repeat: usize,
-    /// Input tokens the repeat runs consumed — savings partly refunded.
-    pub repeat_input_tokens: usize,
+    /// Saving that a repeat re-booked: the repeat run's own `saved_tokens`.
+    /// This is the portion of the headline total that was claimed twice for the
+    /// same information.
+    pub repeat_saved_tokens: usize,
 }
 
 /// Minutes within which a repeated identical command is treated as a probable
 /// re-run of a lossy result. Chosen, not measured: long enough to cover reading
 /// a truncated result and reacting, short enough to exclude an unrelated later
 /// call. Widening it inflates the count.
-const RERUN_WINDOW_MINUTES: i64 = 10;
+pub const RERUN_WINDOW_MINUTES: i64 = 10;
 
 /// Index required by [`Tracker::rerun_stats`]. Without it the self-join degrades
 /// to a full scan per candidate row: **measured 22.45s** against a 53,855-row
@@ -427,6 +431,8 @@ impl Tracker {
             "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
             [],
         )?;
+        // Required by rerun_stats; see RERUN_INDEX_DDL for the measurement.
+        self.conn.execute(RERUN_INDEX_DDL, [])?;
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS parse_failures (
                 id INTEGER PRIMARY KEY,
@@ -665,10 +671,7 @@ impl Tracker {
     /// Rows written before the `lossiness` column existed read as `unknown`
     /// through the column default; a NULL is also folded into `unknown` so a
     /// database migrated by an older build cannot silently vanish from the total.
-    pub fn lossiness_breakdown(
-        &self,
-        project_scope: Option<&str>,
-    ) -> Result<LossinessBreakdown> {
+    pub fn lossiness_breakdown(&self, project_scope: Option<&str>) -> Result<LossinessBreakdown> {
         let (clause, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &project_scope {
             Some(p) => ("WHERE project_path = ?1", vec![p]),
             None => ("", vec![]),
@@ -723,7 +726,7 @@ impl Tracker {
         };
 
         let sql = format!(
-            "SELECT COUNT(*), COALESCE(SUM(b.input_tokens), 0)
+            "SELECT COUNT(*), COALESCE(SUM(b.saved_tokens), 0)
              FROM commands a
              JOIN commands b
                ON b.rtk_cmd = a.rtk_cmd
@@ -731,7 +734,7 @@ impl Tracker {
               AND b.id > a.id
              WHERE a.lossiness IN ('tail','whole')
                {scope_clause}
-               AND (julianday(b.timestamp) - julianday(a.timestamp)) * 24 * 60 <= {RERUN_WINDOW_MINUTES}
+               AND (CAST(strftime('%s', b.timestamp) AS INTEGER) - CAST(strftime('%s', a.timestamp) AS INTEGER)) <= {RERUN_WINDOW_MINUTES} * 60
                AND b.id = (
                      SELECT MIN(c.id) FROM commands c
                      WHERE c.rtk_cmd = a.rtk_cmd
@@ -748,7 +751,7 @@ impl Tracker {
 
         Ok(RerunStats {
             lossy_followed_by_repeat: count as usize,
-            repeat_input_tokens: tokens as usize,
+            repeat_saved_tokens: tokens as usize,
         })
     }
 
@@ -1917,7 +1920,9 @@ mod tests {
         tracker
             .record_with_loss("df -h", "rtk:toml df -h", 100, 10, 5, "tail")
             .unwrap();
-        tracker.record("git status", "rtk git status", 100, 10, 5).unwrap();
+        tracker
+            .record("git status", "rtk git status", 100, 10, 5)
+            .unwrap();
 
         let mut stmt = tracker
             .conn
@@ -1941,9 +1946,15 @@ mod tests {
     #[test]
     fn lossiness_breakdown_counts_each_bucket_and_lossy_savings() {
         let tracker = Tracker::new_in_memory().unwrap();
-        tracker.record_with_loss("a", "rtk:toml a", 100, 10, 1, "none").unwrap();
-        tracker.record_with_loss("b", "rtk:toml b", 100, 10, 1, "tail").unwrap();
-        tracker.record_with_loss("c", "rtk:toml c", 200, 20, 1, "whole").unwrap();
+        tracker
+            .record_with_loss("a", "rtk:toml a", 100, 10, 1, "none")
+            .unwrap();
+        tracker
+            .record_with_loss("b", "rtk:toml b", 100, 10, 1, "tail")
+            .unwrap();
+        tracker
+            .record_with_loss("c", "rtk:toml c", 200, 20, 1, "whole")
+            .unwrap();
         tracker.record("d", "rtk git status", 100, 10, 1).unwrap();
 
         let b = tracker.lossiness_breakdown(None).unwrap();
@@ -1991,6 +2002,29 @@ mod tests {
 
         let s = tracker.rerun_stats(None).unwrap();
         assert_eq!(s.lossy_followed_by_repeat, 1);
-        assert_eq!(s.repeat_input_tokens, 500);
+        assert_eq!(s.repeat_saved_tokens, 500);
+    }
+
+    #[test]
+    fn rerun_stats_window_boundary_is_inclusive() {
+        let tracker = Tracker::new_in_memory().unwrap();
+
+        let insert = |ts: &str, cmd: &str, loss: &str, input: i64| {
+            tracker.conn.execute(
+                "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, lossiness)
+                 VALUES (?1, ?2, ?2, '', ?4, 0, ?4, 100.0, 1, ?3)",
+                params![ts, cmd, loss, input],
+            ).unwrap();
+        };
+
+        // Exactly RERUN_WINDOW_MINUTES apart -> must still count.
+        insert("2026-08-24T10:00:00+00:00", "rtk:toml df -h", "tail", 500);
+        insert("2026-08-24T10:10:00+00:00", "rtk:toml df -h", "tail", 500);
+
+        let s = tracker.rerun_stats(None).unwrap();
+        assert_eq!(
+            s.lossy_followed_by_repeat, 1,
+            "a gap of exactly RERUN_WINDOW_MINUTES must be inclusive"
+        );
     }
 }

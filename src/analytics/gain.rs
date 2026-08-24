@@ -1,7 +1,9 @@
 //! Shows users how many tokens RTK has saved them over time.
 
 use crate::core::display_helpers::{format_duration, print_period_table};
-use crate::core::tracking::{DayStats, MonthStats, Tracker, WeekStats};
+use crate::core::tracking::{
+    DayStats, LossinessBreakdown, MonthStats, RerunStats, Tracker, WeekStats, RERUN_WINDOW_MINUTES,
+};
 use crate::core::utils::{format_tokens, truncate};
 use crate::hooks::hook_check;
 use anyhow::{Context, Result};
@@ -159,34 +161,60 @@ pub fn run(
             eprintln!();
         }
 
-        let loss = tracker.lossiness_breakdown(project_scope.as_deref())?;
-        if loss.total > 0 {
-            println!();
-            println!("{}", styled("Filter cost", true));
-            println!(
-                "  filters classified: lossless {}   tail-dropping {}   fully-replacing {}",
-                loss.none, loss.tail, loss.whole
-            );
-            println!(
-                "  {} tokens booked as saved by results that dropped output",
-                format_tokens(loss.saved_tokens_in_lossy)
-            );
-            // Never present the buckets above as if they covered all traffic.
-            println!(
-                "  coverage: {:.1}% of {} commands ({} record no lossiness)",
-                loss.known_pct(),
-                loss.total,
-                loss.unknown
-            );
-
-            let rerun = tracker.rerun_stats(project_scope.as_deref())?;
-            if rerun.lossy_followed_by_repeat > 0 {
+        // A broken filter-cost block must cost only itself, not the whole
+        // report: the ALTER TABLE that creates `lossiness` is failure-tolerant
+        // (see init_schema), so the SELECT reading it must degrade the same way.
+        match tracker
+            .lossiness_breakdown(project_scope.as_deref())
+            .context("Failed to load filter-cost breakdown")
+        {
+            Ok(loss) if loss.total > 0 => {
+                println!();
+                println!("{}", styled("Filter cost", true));
                 println!(
-                    "  {} lossy results were re-run within 10 min, costing {} input tokens back",
-                    rerun.lossy_followed_by_repeat,
-                    format_tokens(rerun.repeat_input_tokens)
+                    "  filters classified: lossless {}   tail-dropping {}   fully-replacing {}",
+                    loss.none, loss.tail, loss.whole
                 );
+                println!(
+                    "  {} tokens booked as saved by results that dropped output",
+                    format_tokens(loss.saved_tokens_in_lossy)
+                );
+                // Never present the buckets above as if they covered all traffic.
+                let pct = loss.known_pct();
+                let pct_text = if pct > 0.0 && pct < 0.1 {
+                    "<0.1".to_string()
+                } else {
+                    format!("{pct:.1}")
+                };
+                println!(
+                    "  coverage: {}% of {} commands ({} record no lossiness)",
+                    pct_text, loss.total, loss.unknown
+                );
+
+                match tracker
+                    .rerun_stats(project_scope.as_deref())
+                    .context("Failed to load re-run stats")
+                {
+                    Ok(rerun) if rerun.lossy_followed_by_repeat > 0 => {
+                        println!(
+                            "  {} lossy results were re-run within {} min, re-booking {} tokens of saving",
+                            rerun.lossy_followed_by_repeat,
+                            RERUN_WINDOW_MINUTES,
+                            format_tokens(rerun.repeat_saved_tokens)
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "{}",
+                        format!("[rtk] re-run report unavailable: {e}").yellow()
+                    ),
+                }
             }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "{}",
+                format!("[rtk] filter-cost report unavailable: {e}").yellow()
+            ),
         }
 
         if !summary.by_command.is_empty() {
@@ -536,6 +564,10 @@ fn print_monthly(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
 #[derive(Serialize)]
 struct ExportData {
     summary: ExportSummary,
+    // Coverage caveat for `total_saved` above: the text report shows this
+    // alongside the savings, and a JSON consumer needs the same warning.
+    filter_cost: LossinessBreakdown,
+    rerun: RerunStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     daily: Option<Vec<DayStats>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -566,6 +598,12 @@ fn export_json(
     let summary = tracker
         .get_summary_filtered(project_scope) // changed: use filtered variant
         .context("Failed to load token savings summary from database")?;
+    let filter_cost = tracker
+        .lossiness_breakdown(project_scope)
+        .context("Failed to load filter-cost breakdown")?;
+    let rerun = tracker
+        .rerun_stats(project_scope)
+        .context("Failed to load re-run stats")?;
 
     let export = ExportData {
         summary: ExportSummary {
@@ -577,6 +615,8 @@ fn export_json(
             total_time_ms: summary.total_time_ms,
             avg_time_ms: summary.avg_time_ms,
         },
+        filter_cost,
+        rerun,
         daily: if all || daily {
             Some(tracker.get_all_days_filtered(project_scope)?) // changed: use filtered
         } else {
