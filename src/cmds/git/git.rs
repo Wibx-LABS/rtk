@@ -498,18 +498,7 @@ fn run_log(
     }
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
-    let rendered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
-    let mut filtered = never_worse(&result.stdout, &rendered).to_string();
-    // The notice is metadata about what rtk withheld, not rendered content, so it
-    // is appended after never_worse rather than weighed by it. never_worse compares
-    // against result.stdout, which on this path rtk already capped via its own -N
-    // injection — so it is not the unfiltered output the guard assumes, and weighing
-    // the notice against it deletes the notice exactly when the output is most
-    // misleading. The rendering itself is still guarded: filter_log_output can only
-    // shrink its input, so the comparison above remains meaningful for that.
-    if !user_set_limit && log_item_count(&result.stdout, has_format_flag) > limit {
-        filtered.push_str(&log_cap_notice(limit));
-    }
+    let filtered = render_log(&result.stdout, limit, user_set_limit, has_format_flag);
     println!("{}", filtered);
 
     timer.track(
@@ -659,6 +648,27 @@ pub(crate) fn log_cap_notice(limit: usize) -> String {
         "\n(rtk showed the {limit} most recent commits; history continues past them. \
          Pass -N for a different count, or `rtk proxy git log …` for the full output.)"
     )
+}
+
+/// Render a captured `git log` result the way `run_log` emits it.
+///
+/// Owns the ordering that matters: the rendering is bounded by `never_worse`,
+/// and the cap notice is appended *after* that guard, never weighed by it —
+/// `result.stdout` is already capped by rtk's own `-N` injection, so it is not
+/// the unfiltered output `never_worse` assumes. Extracted from `run_log` so a
+/// test can exercise the real ordering instead of re-deriving it.
+pub(crate) fn render_log(
+    raw: &str,
+    limit: usize,
+    user_set_limit: bool,
+    has_format_flag: bool,
+) -> String {
+    let rendered = filter_log_output(raw, limit, user_set_limit, has_format_flag);
+    let mut out = never_worse(raw, &rendered).to_string();
+    if !user_set_limit && log_item_count(raw, has_format_flag) > limit {
+        out.push_str(&log_cap_notice(limit));
+    }
+    out
 }
 
 /// Truncate a single line to `width` characters, appending "..." if needed
@@ -3393,23 +3403,40 @@ To https://github.com/foo/bar.git
 
     #[test]
     fn compact_format_still_gets_the_notice_despite_never_worse() {
-        // A bare date format makes the notice cost more than the capped raw output,
-        // which previously made never_worse discard it — the output then showed one
-        // extra line and claimed nothing was missing. The notice must survive.
+        // A bare date format makes the notice cost more than the capped raw output.
+        // When the notice was inside never_worse, the guard discarded it — showing
+        // one extra line and claiming nothing was missing. This calls the real
+        // rendering path, so moving the notice back inside never_worse fails here.
         let raw: String = (0..51).map(|_| "2026-08-24\n").collect();
-        let rendered = filter_log_output(&raw, 50, false, true);
-        let mut out = never_worse(&raw, &rendered).to_string();
-        if log_item_count(&raw, true) > 50 {
-            out.push_str(&log_cap_notice(50));
-        }
+        let out = render_log(&raw, 50, false, true);
         assert!(
             out.contains("history continues"),
             "the notice must survive never_worse on a compact format: {out}"
         );
         assert_eq!(
-            log_item_count(&out, true),
-            51,
-            "50 rendered dates plus the one notice line"
+            out.lines().filter(|l| l.starts_with("2026")).count(),
+            50,
+            "exactly the cap should be rendered, not the probe item"
+        );
+    }
+
+    #[test]
+    fn render_log_stays_silent_when_the_user_set_the_limit() {
+        let raw: String = (0..51).map(|_| "2026-08-24\n").collect();
+        let out = render_log(&raw, 3, true, true);
+        assert!(
+            !out.contains("history continues"),
+            "an explicit -N was honoured exactly; nothing was withheld: {out}"
+        );
+    }
+
+    #[test]
+    fn render_log_stays_silent_when_history_is_shorter_than_the_cap() {
+        let raw = "2026-08-24\n2026-08-23\n".to_string();
+        let out = render_log(&raw, 50, false, true);
+        assert!(
+            !out.contains("history continues"),
+            "claiming truncation that did not happen is the opposite lie: {out}"
         );
     }
 }
