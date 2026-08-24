@@ -13,6 +13,10 @@ fn rtk_grep(args: &[&str]) -> (String, Option<i32>) {
     let mut a = vec!["grep"];
     a.extend_from_slice(args);
     let out = Command::new(env!("CARGO_BIN_EXE_rtk"))
+        .env(
+            "RTK_DB_PATH",
+            std::env::temp_dir().join(format!("rtk-it-{}.db", std::process::id())),
+        )
         .args(&a)
         .output()
         .expect("rtk");
@@ -179,7 +183,14 @@ fn piped_stdin_matches_grep() {
     for args in [vec!["apple"], vec!["-n", "apple"]] {
         let mut rtk_args = vec!["grep"];
         rtk_args.extend_from_slice(&args);
-        let rtk = feed(Command::new(env!("CARGO_BIN_EXE_rtk")).args(&rtk_args));
+        let rtk = feed(
+            Command::new(env!("CARGO_BIN_EXE_rtk"))
+                .env(
+                    "RTK_DB_PATH",
+                    std::env::temp_dir().join(format!("rtk-it-{}.db", std::process::id())),
+                )
+                .args(&rtk_args),
+        );
         let grep = feed(Command::new("grep").args(&args));
         assert_eq!(rtk, grep, "piped stdin mismatch for {args:?}");
     }
