@@ -2723,11 +2723,11 @@ A  added.rs
 
     #[test]
     fn a_commit_body_containing_the_old_delimiter_does_not_drop_commits() {
-        // Regression: rtk used to separate records with the literal "---END---".
-        // A commit body containing that text split into extra fragments, and the
-        // renderer's take(limit) then discarded real commits — five in, three out,
-        // with no error and no notice. NUL cannot appear in a commit message at
-        // all (git rejects it at write time), so the collision class is gone.
+        // Regression: without NUL separation, a commit body containing the
+        // literal "---END---" splits one record into several, and take(limit)
+        // then discards real commits — five in, three out, silently.
+        // NUL cannot appear in a commit message at all (git rejects it at write
+        // time), so the collision class is gone.
         let mut raw = String::new();
         for i in (1..=5).rev() {
             raw.push_str(&format!("hash{i} commit {i} (1 day ago) <t>\n"));
