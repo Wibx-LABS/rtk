@@ -1,8 +1,11 @@
 //! Filters npm output and auto-injects the "run" subcommand when appropriate.
 
+use crate::cmds::js::vitest_cmd;
 use crate::core::runner;
 use crate::core::utils::resolved_command;
+use crate::Commands;
 use anyhow::Result;
+use std::fs;
 
 /// Known npm subcommands that should NOT get "run" injected.
 /// Shared between production code and tests to avoid drift.
@@ -73,6 +76,52 @@ const NPM_SUBCOMMANDS: &[&str] = &[
     "restart",
 ];
 
+/// Test runners that have a dedicated RTK filter worth more than npm's generic one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptRunner {
+    Jest,
+    Vitest,
+}
+
+/// Shell syntax that makes a script more than a single runner invocation.
+///
+/// This list is a refusal, not a parser: the dedicated filters exec the runner
+/// binary directly, so routing `"test": "vitest run && node --test tests/*.mjs"`
+/// would silently drop the second half of the script. Anything shaped like more
+/// than one command stays on the npm path, where the whole script still runs.
+/// `&&` and `||` are absent on purpose: `&` and `|` already subsume them, and a
+/// list with both lets a test pass for the wrong reason.
+const SHELL_OPERATORS: &[&str] = &["|", "&", ";", ">", "<", "$(", "`", "\n"];
+
+/// Read `scripts.<name>` from the package.json in the current directory.
+fn script_body(name: &str) -> Option<String> {
+    let raw = fs::read_to_string("package.json").ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    json.get("scripts")?
+        .get(name)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Recognise a script that is exactly one test-runner invocation.
+///
+/// Returns the runner and the arguments the script itself passes. `None` means
+/// the script is something else, or is compound — see `SHELL_OPERATORS`.
+fn detect_script_runner(script: &str) -> Option<(ScriptRunner, Vec<String>)> {
+    if SHELL_OPERATORS.iter().any(|op| script.contains(op)) {
+        return None;
+    }
+
+    let mut tokens = script.split_whitespace();
+    let runner = match tokens.next()? {
+        "jest" => ScriptRunner::Jest,
+        "vitest" => ScriptRunner::Vitest,
+        _ => return None,
+    };
+
+    Some((runner, tokens.map(str::to_string).collect()))
+}
+
 pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     // Determine if this is "npm run <script>" or another npm subcommand (install, list, etc.)
     // Only inject "run" when args look like a script name, not a known npm subcommand.
@@ -91,7 +140,52 @@ pub fn run(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
         effective_args.extend_from_slice(args);
     }
 
+    // `npm run test` on a suite RTK already knows how to compact: send it to that
+    // filter instead of npm's generic one. Measured on NEXOS/frontend, whose script
+    // is plain `jest`: 620,114 bytes through npm, 3,601 through the jest filter.
+    //
+    // Skipped when --skip-env is set, because the dedicated path builds its own
+    // command and would drop SKIP_ENV_VALIDATION without saying so.
+    if !skip_env {
+        if let Some(routed) = route_to_test_filter(&effective_args, verbose) {
+            return routed;
+        }
+    }
+
     run_filtered("npm", &effective_args, verbose, skip_env)
+}
+
+/// Route `run <script> [args…]` to a dedicated test-runner filter when the script
+/// is exactly that runner. `None` leaves the call on the ordinary npm path.
+fn route_to_test_filter(effective_args: &[String], verbose: u8) -> Option<Result<i32>> {
+    let (first, rest) = effective_args.split_first()?;
+    if first != "run" {
+        return None;
+    }
+
+    let (script_name, user_args) = rest.split_first()?;
+    let (runner, mut runner_args) = detect_script_runner(&script_body(script_name)?)?;
+
+    // npm's `--` only separates script args from npm's own; the runner never sees it.
+    runner_args.extend(user_args.iter().filter(|a| *a != "--").cloned());
+
+    let command = match runner {
+        ScriptRunner::Jest => Commands::Jest {
+            args: runner_args.clone(),
+        },
+        ScriptRunner::Vitest => Commands::Vitest {
+            args: runner_args.clone(),
+        },
+    };
+
+    let raw_label = format!("npm {}", effective_args.join(" "));
+    let rtk_label = format!("rtk {}", raw_label);
+    Some(vitest_cmd::run_test(
+        &command,
+        &runner_args,
+        verbose,
+        Some((&raw_label, &rtk_label)),
+    ))
 }
 
 /// Run an npx tool through the same filtered pipeline as `npm`.
@@ -170,6 +264,58 @@ fn filter_npm_output(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detect_script_runner_plain_runners() {
+        assert_eq!(
+            detect_script_runner("jest"),
+            Some((ScriptRunner::Jest, vec![]))
+        );
+        assert_eq!(
+            detect_script_runner("vitest run"),
+            Some((ScriptRunner::Vitest, vec!["run".to_string()]))
+        );
+        assert_eq!(
+            detect_script_runner("jest --ci --coverage"),
+            Some((
+                ScriptRunner::Jest,
+                vec!["--ci".to_string(), "--coverage".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_detect_script_runner_refuses_compound_scripts() {
+        // The dedicated filter execs the runner directly, so a compound script
+        // must stay on the npm path or the rest of it silently never runs.
+        for script in [
+            "vitest run && node --test tests/*.test.mjs",
+            "jest || echo failed",
+            "jest; echo done",
+            "jest | tee out.log",
+            "jest > out.log",
+            "$(which jest)",
+        ] {
+            assert_eq!(detect_script_runner(script), None, "script: {}", script);
+        }
+    }
+
+    #[test]
+    fn test_detect_script_runner_ignores_other_tools() {
+        for script in ["next build", "tsc --noEmit", "mocha", "node --test", ""] {
+            assert_eq!(detect_script_runner(script), None, "script: {}", script);
+        }
+    }
+
+    #[test]
+    fn test_route_to_test_filter_requires_run_subcommand() {
+        // Guards the shape of the call, not the filesystem: "install" is not "run",
+        // so routing must decline before it ever looks for a package.json.
+        let args = vec!["install".to_string(), "jest".to_string()];
+        assert!(route_to_test_filter(&args, 0).is_none());
+        assert!(route_to_test_filter(&["run".to_string()], 0).is_none());
+        assert!(route_to_test_filter(&[], 0).is_none());
+    }
 
     #[test]
     fn test_filter_npm_output() {

@@ -199,7 +199,19 @@ fn extract_failures_regex(output: &str) -> Vec<TestFailure> {
     failures
 }
 
-pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32> {
+/// Run a JS test framework and show only what failed.
+///
+/// `origin` names the command the caller actually typed, for analytics only. It is
+/// `None` for `rtk jest` / `rtk vitest`, where the typed command already matches the
+/// framework, and `Some(("npm run test", "rtk npm run test"))` when `npm_cmd` routed
+/// a package.json script here — otherwise the record would claim a command the user
+/// never ran, and the saving could not be attributed to the routing.
+pub fn run_test(
+    command: &Commands,
+    args: &[String],
+    verbose: u8,
+    origin: Option<(&str, &str)>,
+) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
     let mut passthrough_requested = false;
 
@@ -253,12 +265,11 @@ pub fn run_test(command: &Commands, args: &[String], verbose: u8) -> Result<i32>
     let rendered = render_test_output(&filtered, &combined, &tee_label, result.exit_code);
     let shown = crate::core::runner::emit_guarded(&rendered, None, &combined);
 
-    timer.track(
-        format!("{} run", framework).as_str(),
-        format!("rtk {} run", framework).as_str(),
-        &combined,
-        &shown,
-    );
+    let (raw_label, rtk_label) = match origin {
+        Some((raw, rtk)) => (raw.to_string(), rtk.to_string()),
+        None => (format!("{} run", framework), format!("rtk {} run", framework)),
+    };
+    timer.track(&raw_label, &rtk_label, &combined, &shown);
 
     if !result.success() {
         return Ok(result.exit_code);
@@ -350,7 +361,11 @@ fn format_test_output(
         }
         ParseResult::Passthrough(_) => {
             emit_passthrough_warning(framework, "All parsing tiers failed");
-            format_passthrough_output(stdout)
+            // `combined`, not `stdout`: when the parse fails because the run never
+            // produced JSON, the reason is on stderr. Reading stdout alone showed the
+            // warning and nothing else -- `jest --json --testPathPattern=nope` writes
+            // 0 bytes to stdout and "No tests found, exiting with code 1" to stderr.
+            format_passthrough_output(combined)
         }
     }
 }
@@ -413,6 +428,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_passthrough_fallback_keeps_the_stderr_reason() {
+        // A run that never produced JSON puts its reason on stderr. Formatting the
+        // fallback from stdout alone leaves the caller with a warning and no cause.
+        let stdout = "";
+        let combined = "No tests found, exiting with code 1\nRun with `--passWithNoTests` to exit with code 0\n";
+
+        let out = format_test_output("jest", stdout, combined, false, 0);
+
+        assert!(
+            out.text.contains("No tests found"),
+            "passthrough dropped the only explanation; got: {:?}",
+            out.text
+        );
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
