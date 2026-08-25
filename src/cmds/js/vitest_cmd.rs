@@ -361,7 +361,11 @@ fn format_test_output(
         }
         ParseResult::Passthrough(_) => {
             emit_passthrough_warning(framework, "All parsing tiers failed");
-            format_passthrough_output(stdout)
+            // `combined`, not `stdout`: when the parse fails because the run never
+            // produced JSON, the reason is on stderr. Reading stdout alone showed the
+            // warning and nothing else -- `jest --json --testPathPattern=nope` writes
+            // 0 bytes to stdout and "No tests found, exiting with code 1" to stderr.
+            format_passthrough_output(combined)
         }
     }
 }
@@ -424,6 +428,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_passthrough_fallback_keeps_the_stderr_reason() {
+        // A run that never produced JSON puts its reason on stderr. Formatting the
+        // fallback from stdout alone leaves the caller with a warning and no cause.
+        let stdout = "";
+        let combined = "No tests found, exiting with code 1\nRun with `--passWithNoTests` to exit with code 0\n";
+
+        let out = format_test_output("jest", stdout, combined, false, 0);
+
+        assert!(
+            out.text.contains("No tests found"),
+            "passthrough dropped the only explanation; got: {:?}",
+            out.text
+        );
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
